@@ -1,0 +1,642 @@
+---
+title: "Bayesian Positive Source Separation for Raman Spectroscopy"
+author: "Daniel Krasnov"
+format: html
+execute:
+  cache: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(runjags)
+library(coda)
+library(bayesplot)
+library(ggplot2)
+library(gridExtra)
+library(tidyr)
+data_dir <- "../data"
+source("../R/GBR_NMF.R")
+
+```
+
+# Introduction
+
+This notebook provides a walkthrough of my undergraduate honours thesis project in Bayesian Positive Source Separation (also known as Bayesian Nonnegative Matrix Factorization). Raman spectroscopy is an optical interrogation method capable of providing a unique “fingerprint” for both biological and non-biological compounds. However, the Raman spectra for a given chemical are actually a combination of the constituent spectra, thus, if we want to identify what chemicals are present, we require machine learning techniques to unmix the signal. This thesis combines group- and basis-restricted non-negative matrix factorization (GBR-NMF) [@shreeves2023nonnegative] with Bayesian positive source separation (BPSS) [@brie2016bayesian] to create a probabilistic non-negative matrix factorization technique. Our method not only allows for the incorporation of prior knowledge, but also quantifies the uncertainty in the source separation process, an aspect missing from most standard NMF procedures. We use JAGS to perform Gibbs sampling for posterior inference.
+
+# The BPSS Model
+
+## Model Formulation
+
+BPSS models the observed spectral data as a linear combination of pure component spectra with additive noise. The model is specified as:
+
+$$\mathbf{X} = \mathbf{AS} + \mathbf{E}$$
+
+where:
+
+-   $\mathbf{X}_{m \times n}$ is the data matrix where each row vector represents a spectrum
+-   $\mathbf{A}_{m \times p}$ is the mixing matrix with column vectors representing the mixing coefficients (concentrations) of each pure component
+-   $\mathbf{S}_{p \times n}$ is the spectra matrix where each row vector is one of the $p$ pure spectra
+-   $\mathbf{E}_{m \times n}$ is the additive noise matrix
+
+## Prior Distributions
+
+### Noise Model
+
+Each noise sequence (row vector of $\mathbf{E}$) is assumed to be independently and identically distributed Gaussian with zero mean and constant variance within a row:
+
+$$p(\mathbf{E}|\theta_1)=\prod^m_{i=1}\prod^n_{k=1}\mathcal{N}(E_{(i,k)};0,\sigma^2_i)$$
+
+where $\theta_1 = [\sigma_1^2,\dots,\sigma_m^2]^T$.
+
+### Pure Spectra (S)
+
+Each pure spectrum (row of $\mathbf{S}$) is assumed to follow a Gamma distribution with element-specific hyperparameters:
+
+$$p(\mathbf{S}|\theta_2)=\prod^p_{j=1}\prod^n_{k=1}\mathcal{G}(S_{(j,k)};\alpha_j,\beta_j)$$
+
+where $\theta_2 = [\alpha_1,\dots,\alpha_p,\beta_1,\dots,\beta_p]^T$.
+
+### Mixing Matrix (A)
+
+Each element of the mixing matrix is assumed to follow an Exponential distribution with element-specific rate parameters:
+
+$$p(\mathbf{A}|\theta_3)=\prod^m_{i=1}\prod^p_{j=1}\text{Exp}(A_{(i,j)};\lambda_{i,j})$$
+
+where $\theta_3=[\lambda_{1,1},\dots,\lambda_{m,p}]^T$.
+
+### Hyperparameters
+
+The prior for the precision of the noise is $\mathcal{G}(2,\epsilon)$ assigned to $\frac{1}{\sigma^2_i}$ where $\epsilon$ is a small number (e.g., $10^{-3}$). The hyperparameters of $\mathbf{S}$ follow $\mathcal{G}(2,\epsilon)$ priors. The rate parameters $\lambda_{i,j}$ of the Exponential distribution for $\mathbf{A}$ also follow $\mathcal{G}(2,\epsilon)$ priors.
+
+## Likelihood
+
+The likelihood of the model is:
+
+$$p(\mathbf{X}|\mathbf{S},\mathbf{A},\theta_1)\propto \prod^m_{i=1}\prod^n_{k=1}\left(\frac{1}{\sigma_i}\right)^n\exp \left[ -\frac{1}{2\sigma_i^2}\left(X_{(i,k)}-[\mathbf{AS}]_{(i,k)}\right)^2\right]$$
+
+# Helper Functions
+
+These functions allow us to report 95% credible intervals and median point estimates for our model.
+
+```{r helper-functions}
+summar_A <- function(A, n = 3, func) {
+  res <- list()
+  for (i in 1:n) {
+    a1 <- A[, grep(paste0("A\\[", i, ","), names(A))]
+    a1_mean <- apply(a1, MARGIN = 2, func)
+    res <- c(res, list(a1_mean))
+  }
+  res
+}
+
+summar_S <- function(S, n = 4, func) {
+  res <- list()
+  for (i in 1:n) {
+    s1 <- S[, grep(paste0("S\\[", i, ","), names(S))]
+    s1_mean <- apply(s1, MARGIN = 2, func)
+    res <- c(res, list(s1_mean))
+  }
+  res
+}
+
+get_AS_hat <- function(A, S, estimate = "median", na = 15, ns = 4) {
+  switch(
+    estimate,
+    median = list(
+      A = summar_A(A, na, func = median),
+      S = summar_S(S, ns, func = median)
+    ),
+    mode = list(
+      A = summar_A(A, na, func = mode),
+      S = summar_S(S, ns, func = mode)
+    ),
+    mean = list(
+      A = summar_A(A, na, func = mean),
+      S = summar_S(S, ns, func = mean)
+    )
+  )
+}
+
+scale_row_S <- function(row) {
+  min_val <- min(row)
+  max_val <- max(row)
+  (row - min_val) / (max_val - min_val)
+}
+
+scale_row_A <- function(row) {
+  row / sum(row)
+}
+
+mode <- function(x) {
+  unique_x <- unique(x)
+  unique_x[which.max(tabulate(match(x, unique_x)))]
+}
+
+get_plots_95_ci_spec <- function(p, S, func = "median", n = 2) {
+  res <- list()
+  for (i in 1:n) {
+    s1 <- S[, grep(paste0("S\\[", i, ","), names(S))]
+    s1_mean <- apply(s1, MARGIN = 2, func)
+    s1_lower <- apply(s1, MARGIN = 2, function(x) quantile(x, probs = 0.025))
+    s1_upper <- apply(s1, MARGIN = 2, function(x) quantile(x, probs = 0.975))
+    res <- c(res, list(
+      spectra = s1_mean,
+      lower = s1_lower,
+      upper = s1_upper
+    ))
+  }
+  res
+}
+
+plot_95_ci_spec <- function(res, wavelength, spec_num) {
+  i <- switch(as.character(spec_num),
+              '1' = 1, '2' = 4, '3' = 7, '4' = 10)
+  
+  spectrum <- res[[i]]
+  lower_bound <- res[[i+1]]
+  upper_bound <- res[[i+2]]
+  
+  data <- data.frame(wavelength, spectrum, lower_bound, upper_bound)
+  
+  g1 <- ggplot(data, aes(x = wavelength)) +
+    geom_ribbon(aes(ymin = lower_bound, ymax = upper_bound),
+                fill = "red", alpha = 0.3) +
+    geom_line(aes(y = spectrum), color = "blue", linewidth = 0.8) +
+    theme_minimal() +
+    labs(title = paste0("Median Spectrum ", spec_num, " with 95% CI"),
+         x = "Raman Shift (index)",
+         y = "Intensity")
+  g1
+}
+
+get_A_values_and_median <- function(A, n = 2, func) {
+  res <- list()
+  for (i in 1:n) {
+    a1 <- A[, grep(paste0("A\\[", i, ","), names(A))]
+    a1_mean <- apply(a1, MARGIN = 2, func)
+    res <- c(res, list("est" = a1_mean, "values" = a1))
+  }
+  res
+}
+
+get_plots_A_hist <- function(A_list, i) {
+  dens <- density(A_list$values[, i])
+  ci <- quantile(A_list$values[, i], probs = c(0.025, 0.975))
+  
+  dens_df <- data.frame(x = dens$x, y = dens$y)
+  ci_df <- dens_df[dens_df$x >= ci[1] & dens_df$x <= ci[2], ]
+  
+  g1 <- ggplot() +
+    geom_line(data = dens_df, aes(x = x, y = y), color = "blue") +
+    geom_area(data = ci_df, aes(x = x, y = y), fill = "blue", alpha = 0.5) +
+    geom_vline(xintercept = A_list$est[i], color = "red", 
+               linetype = "dashed", linewidth = 1) +
+    theme_minimal() +
+    labs(title = paste("Posterior Distribution of A[1,", i, "]"),
+         x = "Value",
+         y = "Density")
+  
+  return(g1)
+}
+```
+
+# JAGS Model Specification
+
+We use a Gamma-Exponential BPSS model where the pure spectra matrix S follows an Exponential distribution and the mixing matrix A follows a Gamma distribution:
+
+```{r jags-model}
+BPSS_Gamma_Exponential <- "
+model {
+    for (i in 1:m) {
+        for (k in 1:n) {
+            X[i, k] ~ dnorm(mu[i, k], tau[i])
+            mu[i, k] <- inprod(A[i, ], S[, k])
+        }
+    }
+    
+    for (j in 1:p) {
+        for (k in 1:n) {
+            S[j, k] ~ dexp(lambda_s[j,k]) T(0.001,1.001)
+        }
+    }
+    
+    for (i in 1:m) {
+      for (j in 1:p) {
+        A[i, j] ~ dgamma(alpha_a[i,j], beta_a[i,j]) T(0.001, 1.001)
+      }
+    }
+    
+    for (j in 1:p) {
+        for (k in 1:n) {
+           lambda_s[j,k] ~ dgamma(2, E)
+        }
+    }
+    
+    for (i in 1:m) {
+        for (j in 1:p) {
+            alpha_a[i,j] ~ dgamma(2, E)
+            beta_a[i,j] ~ dgamma(2, E)
+        }
+    }
+    
+    for (i in 1:m) {
+        tau[i] ~ dgamma(2, E)
+    }
+}
+"
+```
+
+# Application to Raman Spectroscopy Data
+
+## Data Description
+
+We analyze Raman spectra data from four biochemicals: Citric acid, Glucose, Glycine, and Serine. The data was provided from [@milligan2023reconstruction]. For each biochemical, spectra of both the solid form and liquid form (dissolved in deionized water) were collected. Five mixtures (A1-A5) were created with varying concentrations of each biochemical.
+
+### Mixture Concentrations
+
+The true mixing proportions for each mixture are:
+
+```{r mixture-concentrations}
+A1 <- c(0.25, 0.25, 0.25, 0.25)
+A2 <- c(0.45, 0.18, 0.18, 0.18)
+A3 <- c(0.18, 0.45, 0.18, 0.18)
+A4 <- c(0.18, 0.18, 0.45, 0.18)
+A5 <- c(0.18, 0.18, 0.18, 0.45)
+
+values <- c(A1, A2, A3, A4, A5)
+A_true <- rbind(A1, A2, A3, A4, A5)
+conditions <- rep(c("A1", "A2", "A3", "A4", "A5"), each = 4)
+chemicals <- rep(c("Citric acid", "Glucose", "Glycine", "Serine"), times = 5)
+
+data_df <- data.frame(Condition = conditions, Chemical = chemicals, Value = values)
+
+ggplot(data_df, aes(x = Condition, y = Value, fill = Chemical)) +
+  geom_bar(stat = "identity", position = position_dodge(), alpha = 0.8) +
+  scale_fill_manual(
+    values = c(
+      "Citric acid" = "#D1BCE3",
+      "Glucose" = "#C49BBB",
+      "Glycine" = "#A1867F",
+      "Serine" = "#585481"
+    )
+  ) +
+  labs(title = "Biochemical Mixture Concentrations",
+       x = "Mixtures",
+       y = "Proportion",
+       fill = "Chemical") +
+  theme_minimal()
+```
+
+### Pure Component Spectra
+
+We use the Raman spectra of the dissolved biochemicals:
+
+```{r pure-spectra-liquid}
+pure_diss_df <- read.csv(file.path(data_dir, "4BasesLiquid_CA-Glu-Gly-Ser.csv"), header = FALSE)
+titles <- c("Citric acid", "Glucose", "Glycine", "Serine")
+plot_list <- vector("list", 4)
+
+for (i in 1:4) {
+  spectrum_data <- t(pure_diss_df[i,]) |> as.data.frame()
+  colnames(spectrum_data) <- c("Intensity")
+  spectrum_data$RamanShift <- 1:ncol(pure_diss_df)
+  
+  plot_list[[i]] <- ggplot(spectrum_data, aes(x = RamanShift, y = Intensity)) +
+    geom_line(color = "darkgreen", linewidth = 0.7) +
+    labs(title = titles[i], x = "Raman Shift (index)", y = "Intensity") +
+    theme_minimal()
+}
+
+grid.arrange(grobs = plot_list, ncol = 2)
+```
+
+### Observed Mixture Data
+
+The data we analyze consists of 3 replicates of the 5 mixtures (15 total observations):
+
+```{r mixture-data}
+misc_gbrnmf <- read.csv(file.path(data_dir, "nmf_data_CA_Glu_Gly_Ser.csv"), header = FALSE)
+head(misc_gbrnmf[, 1:6])
+```
+
+Let's visualize the Raman spectra we will need to unmix for each mixture:
+
+```{r visualize-mixtures}
+par(mfrow = c(2, 3))
+titles_mix <- sapply(1:5, function(i) paste0("A", i, "-", 1:3)) |> as.vector()
+
+for (j in c(1, 4, 7, 10, 13)) {
+  plot(1:length(misc_gbrnmf[j,]), as.numeric(misc_gbrnmf[j,]), 
+       type = "l", ylab = "Intensity", xlab = "Raman Shift (index)", 
+       col = 1, lty = 1, main = paste("Mixture", ceiling(j/3))) 
+  for (i in (j+1):(j+2)) {
+    lines(1:length(misc_gbrnmf[i,]), as.numeric(misc_gbrnmf[i,]), 
+          col = i - j + 1, lty = i - j + 1)
+  }
+  legend("topright", legend = titles_mix[j:(j+2)], col = 1:3, lty = 1:3, cex = 0.7)
+}
+```
+
+## GBR-NMF Initialization
+
+Before running BPSS, we use GBR-NMF to obtain initial estimates. This is crucial because BPSS solutions are not unique, and good initialization helps the MCMC sampler converge to meaningful solutions.
+
+```{r gbrnmf-initialization}
+bases <- matrix(c(
+  as.numeric(pure_diss_df[1, ]),
+  as.numeric(pure_diss_df[2, ]),
+  as.numeric(pure_diss_df[3, ]),
+  as.numeric(pure_diss_df[4, ])
+), nrow = 4, ncol = ncol(pure_diss_df), byrow = TRUE)
+
+mat <- as.matrix(misc_gbrnmf[c(1, 4, 7, 10, 13), ])
+mat <- t(apply(mat, 1, scale_row_S))
+
+nmf.out <- cnmf(mat, maxit = 10000, q = 4, s = bases)
+
+w <- nmf.out$w
+a <- nmf.out$a
+s <- nmf.out$s
+```
+
+The way GBR-NMF works is by setting component signals as constant and estimating their concentrations. Since our method is initialized at this solution, but allows component signals to vary, we can interpret our model as a probabilistic version of GBR-NMF.
+
+## Setting Up BPSS Priors
+
+We use the GBR-NMF results to inform our priors. Specifically, we set the expectation of each random variable to its corresponding GBR-NMF value, with variance set to 0.01.
+
+```{r setup-priors}
+E <- 1 * 10^-3
+
+wa <- w %*% a
+
+# Normalize each row (mixture) to sum to 1
+wa <- t(apply(wa, 1, scale_row_A))
+
+# Ensure values are within truncation bounds [0.001, 1.001]
+wa <- pmax(pmin(wa, 1.001), 0.001)
+
+s <- t(apply(s, 1, scale_row_S)) + E
+
+# Ensure s values are within truncation bounds [0.001, 1.001]
+s <- pmax(pmin(s, 1.001), 0.001)
+
+mat <- t(apply(mat, 1, scale_row_S)) + E
+
+s_expects <- s
+a_expects <- wa
+
+var <- 0.01
+
+alpha_a <- a_expects^2 / var
+beta_a <- a_expects / var
+
+lambda_s <- 1 / s_expects
+
+alpha_a[alpha_a == 0 | is.na(alpha_a)] <- E
+beta_a[beta_a == 0 | is.na(beta_a)] <- E
+lambda_s[lambda_s == 0 | is.infinite(lambda_s) | is.na(lambda_s)] <- E
+
+p <- 4
+m <- nrow(mat)
+n <- ncol(mat)
+```
+
+## Running the Gibbs Sampler
+
+Now we can run our MCMC sampler.
+
+```{r run-mcmc}
+mat_jags <- mat
+
+data.list <- list(
+  X = mat_jags,
+  m = m,
+  n = n,
+  p = p,
+  E = E,
+  lambda_s = lambda_s,
+  alpha_a = alpha_a,
+  beta_a = beta_a
+)
+
+params <- c("A", "S")
+
+inits1 <- dump.format(list(
+  A = wa,
+  S = s,
+  .RNG.name = "base::Wichmann-Hill",
+  .RNG.seed = 87460945
+))
+
+inits2 <- dump.format(list(
+  A = wa,
+  S = s,
+  .RNG.name = "base::Marsaglia-Multicarry",
+  .RNG.seed = 874609
+))
+
+inits3 <- dump.format(list(
+  A = wa,
+  S = s,
+  .RNG.name = "base::Super-Duper",
+  .RNG.seed = 8746
+))
+
+inits4 <- dump.format(list(
+  A = wa,
+  S = s,
+  .RNG.name = "base::Mersenne-Twister",
+  .RNG.seed = 874
+))
+
+posterior <- run.jags(
+  model = BPSS_Gamma_Exponential,
+  data = data.list,
+  monitor = params,
+  inits = c(inits1, inits2, inits3, inits4),
+  n.chains = 4,
+  adapt = 1000,
+  burnin = 5000,
+  sample = 5000,
+  thin = 500,
+  method = "parallel"
+)
+```
+
+```{r extract-results}
+AS <- as.mcmc.list(posterior)[[1]] |> as.data.frame()
+for (i in 2:4) {
+  AS <- rbind(AS, as.mcmc.list(posterior)[[i]] |> as.data.frame())
+}
+
+A <- AS[, grep("^A\\[", names(AS))]
+S <- AS[, grep("^S\\[", names(AS))]
+```
+
+## Results
+
+### Recovered Pure Spectra with Uncertainty
+
+```{r plot-recovered-spectra}
+res <- get_plots_95_ci_spec(4, S, "median", 4)
+wavelength <- 1:ncol(mat)
+
+g1 <- plot_95_ci_spec(res, wavelength, 1)
+g2 <- plot_95_ci_spec(res, wavelength, 2)
+g3 <- plot_95_ci_spec(res, wavelength, 3)
+g4 <- plot_95_ci_spec(res, wavelength, 4)
+
+grid.arrange(g1, g2, g3, g4, nrow = 2, ncol = 2)
+```
+
+The blue lines show the median estimates of the recovered pure spectra, while the red shaded regions represent 95% credible intervals. Narrow intervals indicate high confidence in the recovered spectra, while wide intervals suggest greater uncertainty.
+
+### Recovered Mixing Proportions
+
+Let's examine the posterior distributions of the mixing coefficients for the first mixture:
+
+```{r plot-mixing-proportions}
+A_list <- get_A_values_and_median(A, n = m, "median")
+
+g1 <- get_plots_A_hist(A_list, 1)
+g2 <- get_plots_A_hist(A_list, 2)
+g3 <- get_plots_A_hist(A_list, 3)
+g4 <- get_plots_A_hist(A_list, 4)
+
+grid.arrange(g1, g2, g3, g4, nrow = 2, ncol = 2)
+```
+
+The red dashed line shows the median estimate, and the blue shaded area represents the 95% credible interval.
+
+### Compare Estimated vs. True Concentrations
+
+```{r compare-concentrations}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+
+# Get median estimates for all mixtures using helper function
+A_median_list <- summar_A(A, n = m, func = median)
+
+# Extract and normalize to get proportions
+A_estimated <- matrix(0, nrow = m, ncol = p)
+for (i in 1:m) {
+  row_vals <- unlist(A_median_list[[i]])
+  A_estimated[i, ] <- row_vals / sum(row_vals)
+}
+
+m <- nrow(A_true)
+p <- ncol(A_true)
+
+chem_names <- c("Citric acid", "Glucose", "Glycine", "Serine")
+mixture_names <- if (!is.null(rownames(A_true))) rownames(A_true) else paste0("A", seq_len(m))
+
+comparison_df <- tibble(
+  Mixture = rep(mixture_names, each = p),
+  Chemical = rep(chem_names, times = m),
+  True = as.vector(t(A_true)),
+  Estimated = as.vector(t(A_estimated))
+) %>%
+  mutate(
+    Mixture = factor(Mixture, levels = mixture_names),
+    Chemical = factor(Chemical, levels = chem_names)
+  )
+
+make_mixture_plot <- function(mix_name, show_axis_titles = FALSE) {
+  df_mix <- comparison_df %>%
+    filter(Mixture == mix_name) %>%
+    pivot_longer(cols = c(True, Estimated), names_to = "Type", values_to = "Value") %>%
+    mutate(Type = factor(Type, levels = c("True", "Estimated")))
+  
+  p <- ggplot(df_mix, aes(x = Chemical, y = Value, fill = Type)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+    scale_fill_manual(values = c("True" = "gray80", "Estimated" = "#585481")) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 30, hjust = 1),
+      panel.grid.major.x = element_blank(),
+      legend.position = "none"
+    ) +
+    ggtitle(mix_name)
+  
+  if (show_axis_titles) {
+    p <- p + labs(x = "Chemical", y = "Proportion")
+  } else {
+    p <- p + labs(x = NULL, y = NULL)
+  }
+  
+  p
+}
+
+pA1 <- make_mixture_plot("A1", show_axis_titles = FALSE)
+pA2 <- make_mixture_plot("A2", show_axis_titles = FALSE)
+pA3 <- make_mixture_plot("A3", show_axis_titles = TRUE)
+pA4 <- make_mixture_plot("A4", show_axis_titles = TRUE)
+pA5 <- make_mixture_plot("A5", show_axis_titles = TRUE)
+
+layout <- (pA1 | pA2) / (pA3 | pA4 | pA5)
+
+legend_plot <- ggplot(
+  comparison_df %>% filter(Mixture == mixture_names[1]) %>% pivot_longer(c(True, Estimated), names_to = "Type", values_to = "Value"),
+  aes(x = Chemical, y = Value, fill = Type)
+) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  scale_fill_manual(values = c("True" = "gray80", "Estimated" = "#585481")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+final_plot <- layout + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+final_plot
+
+
+```
+
+# Discussion
+
+## Key Advantages of BPSS
+
+1.  **Uncertainty Quantification**: Unlike point estimates from GBR-NMF, BPSS provides full posterior distributions, allowing us to quantify uncertainty in both the recovered spectra and mixing proportions.
+
+2.  **Robust Estimation**: The median estimates are robust to outliers and provide a natural point estimate.
+
+3.  **Prior Information Integration**: By using GBR-NMF initialization, we incorporate domain knowledge while still allowing the model to update these estimates based on the data.
+
+## Interpretation of Results
+
+-   **Narrow Credible Intervals**: Indicate high confidence in the recovered spectra or concentrations. This suggests the data strongly supports these estimates.
+
+-   **Wide Credible Intervals**: Suggest greater uncertainty, which could be due to:
+
+    -   Overlapping spectral features making separation difficult
+    -   Insufficient data
+    -   Model misspecification
+
+-   **Credible Interval Coverage**: If the true values (when known) fall within the credible intervals, this validates the model's uncertainty quantification.
+
+## Limitations and Future Work
+
+1.  **Computational Cost**: MCMC sampling can be computationally intensive, especially for large datasets.
+
+2.  **Model Assumptions**: The model assumes:
+
+    -   Independent Gamma priors (could allow for correlation)
+    -   Gaussian noise (could use robust alternatives like Student-t)
+    -   Known number of components (could be extended to model selection)
+
+3.  **Initialization Sensitivity**: While GBR-NMF initialization helps, the model may still be sensitive to initialization in some cases.
+
+# Conclusion
+
+This notebook demonstrated the application of Bayesian Pure Signal Separation (BPSS) to real Raman spectroscopy data. By combining GBR-NMF initialization with Bayesian inference, we can:
+
+1.  Recover pure component spectra with uncertainty quantification
+2.  Estimate mixing proportions (concentrations) with credible intervals
+3.  Validate the model by comparing estimates to known true values
+
+The Bayesian framework provides a principled approach to incorporating prior knowledge while quantifying uncertainty, making it a valuable tool for spectral analysis applications.
