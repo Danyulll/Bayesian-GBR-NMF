@@ -13,6 +13,8 @@ Raman spectroscopy provides unique "fingerprints" for chemical compounds, but ob
 
 The complete analysis notebook is available on GitHub Pages:
 
-**[View the rendered notebook →](https://danyulll.github.io/Bayesian-GBR-NMF/)**
+**[View the rendered notebook →](https://danyulll.github.io/assets/projects/GBR-NMF/project-4.html)**
+
+
 
 
