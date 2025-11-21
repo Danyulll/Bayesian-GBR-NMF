@@ -1,11 +1,13 @@
 ---
 title: "Bayesian Positive Source Separation for Raman Spectroscopy"
 author: "Daniel Krasnov"
-format: html
+format:
+  html:
+    theme: cosmo
+    toc: true
 execute:
   cache: true
 bibliography: sample.bib
-toc: true
 ---
 
 ```{r setup, include=FALSE}
