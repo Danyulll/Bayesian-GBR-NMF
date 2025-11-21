@@ -5,3 +5,5 @@ ggplot2
 gridExtra
 tidyr
 zoo
+dplyr
+patchwork

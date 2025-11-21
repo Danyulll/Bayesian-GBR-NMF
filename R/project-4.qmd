@@ -4,6 +4,8 @@ author: "Daniel Krasnov"
 format: html
 execute:
   cache: true
+bibliography: sample.bib
+toc: true
 ---
 
 ```{r setup, include=FALSE}
@@ -11,6 +13,8 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
 ```{r libraries}
+#| echo: false
+
 library(runjags)
 library(coda)
 library(bayesplot)
@@ -462,7 +466,7 @@ posterior <- run.jags(
   adapt = 1000,
   burnin = 5000,
   sample = 5000,
-  thin = 500,
+  thin = 10,
   method = "parallel"
 )
 ```
@@ -512,131 +516,12 @@ grid.arrange(g1, g2, g3, g4, nrow = 2, ncol = 2)
 
 The red dashed line shows the median estimate, and the blue shaded area represents the 95% credible interval.
 
-### Compare Estimated vs. True Concentrations
-
-```{r compare-concentrations}
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(patchwork)
-
-# Get median estimates for all mixtures using helper function
-A_median_list <- summar_A(A, n = m, func = median)
-
-# Extract and normalize to get proportions
-A_estimated <- matrix(0, nrow = m, ncol = p)
-for (i in 1:m) {
-  row_vals <- unlist(A_median_list[[i]])
-  A_estimated[i, ] <- row_vals / sum(row_vals)
-}
-
-m <- nrow(A_true)
-p <- ncol(A_true)
-
-chem_names <- c("Citric acid", "Glucose", "Glycine", "Serine")
-mixture_names <- if (!is.null(rownames(A_true))) rownames(A_true) else paste0("A", seq_len(m))
-
-comparison_df <- tibble(
-  Mixture = rep(mixture_names, each = p),
-  Chemical = rep(chem_names, times = m),
-  True = as.vector(t(A_true)),
-  Estimated = as.vector(t(A_estimated))
-) %>%
-  mutate(
-    Mixture = factor(Mixture, levels = mixture_names),
-    Chemical = factor(Chemical, levels = chem_names)
-  )
-
-make_mixture_plot <- function(mix_name, show_axis_titles = FALSE) {
-  df_mix <- comparison_df %>%
-    filter(Mixture == mix_name) %>%
-    pivot_longer(cols = c(True, Estimated), names_to = "Type", values_to = "Value") %>%
-    mutate(Type = factor(Type, levels = c("True", "Estimated")))
-  
-  p <- ggplot(df_mix, aes(x = Chemical, y = Value, fill = Type)) +
-    geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
-    scale_fill_manual(values = c("True" = "gray80", "Estimated" = "#585481")) +
-    theme_minimal(base_size = 12) +
-    theme(
-      axis.text.x = element_text(angle = 30, hjust = 1),
-      panel.grid.major.x = element_blank(),
-      legend.position = "none"
-    ) +
-    ggtitle(mix_name)
-  
-  if (show_axis_titles) {
-    p <- p + labs(x = "Chemical", y = "Proportion")
-  } else {
-    p <- p + labs(x = NULL, y = NULL)
-  }
-  
-  p
-}
-
-pA1 <- make_mixture_plot("A1", show_axis_titles = FALSE)
-pA2 <- make_mixture_plot("A2", show_axis_titles = FALSE)
-pA3 <- make_mixture_plot("A3", show_axis_titles = TRUE)
-pA4 <- make_mixture_plot("A4", show_axis_titles = TRUE)
-pA5 <- make_mixture_plot("A5", show_axis_titles = TRUE)
-
-layout <- (pA1 | pA2) / (pA3 | pA4 | pA5)
-
-legend_plot <- ggplot(
-  comparison_df %>% filter(Mixture == mixture_names[1]) %>% pivot_longer(c(True, Estimated), names_to = "Type", values_to = "Value"),
-  aes(x = Chemical, y = Value, fill = Type)
-) +
-  geom_col(position = position_dodge(width = 0.8)) +
-  scale_fill_manual(values = c("True" = "gray80", "Estimated" = "#585481")) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
-
-final_plot <- layout + plot_layout(guides = "collect") & theme(legend.position = "bottom")
-
-final_plot
-
-
-```
-
 # Discussion
 
-## Key Advantages of BPSS
+With this, we have come up with a probabilstic version of GBR-NMF! So why do we want to do this? Well, there are a two main reasons:
 
 1.  **Uncertainty Quantification**: Unlike point estimates from GBR-NMF, BPSS provides full posterior distributions, allowing us to quantify uncertainty in both the recovered spectra and mixing proportions.
 
-2.  **Robust Estimation**: The median estimates are robust to outliers and provide a natural point estimate.
+2.  **Pure Components Can Change**: By degault GBR-NMF does not allow the pure components to change, but BPSS does. This is important because in reality, the pure components of a chemical can change depending on the conditions of the experiment such as temperature, pressure, and solvent.
 
-3.  **Prior Information Integration**: By using GBR-NMF initialization, we incorporate domain knowledge while still allowing the model to update these estimates based on the data.
-
-## Interpretation of Results
-
--   **Narrow Credible Intervals**: Indicate high confidence in the recovered spectra or concentrations. This suggests the data strongly supports these estimates.
-
--   **Wide Credible Intervals**: Suggest greater uncertainty, which could be due to:
-
-    -   Overlapping spectral features making separation difficult
-    -   Insufficient data
-    -   Model misspecification
-
--   **Credible Interval Coverage**: If the true values (when known) fall within the credible intervals, this validates the model's uncertainty quantification.
-
-## Limitations and Future Work
-
-1.  **Computational Cost**: MCMC sampling can be computationally intensive, especially for large datasets.
-
-2.  **Model Assumptions**: The model assumes:
-
-    -   Independent Gamma priors (could allow for correlation)
-    -   Gaussian noise (could use robust alternatives like Student-t)
-    -   Known number of components (could be extended to model selection)
-
-3.  **Initialization Sensitivity**: While GBR-NMF initialization helps, the model may still be sensitive to initialization in some cases.
-
-# Conclusion
-
-This notebook demonstrated the application of Bayesian Pure Signal Separation (BPSS) to real Raman spectroscopy data. By combining GBR-NMF initialization with Bayesian inference, we can:
-
-1.  Recover pure component spectra with uncertainty quantification
-2.  Estimate mixing proportions (concentrations) with credible intervals
-3.  Validate the model by comparing estimates to known true values
-
-The Bayesian framework provides a principled approach to incorporating prior knowledge while quantifying uncertainty, making it a valuable tool for spectral analysis applications.
+If you would like to read more about the advantages of BPSS, you can read my undergraduate honours thesis here [https://open.library.ubc.ca/soa/cIRcle/collections/undergraduateresearch/52966/items/1.0443983](https://open.library.ubc.ca/soa/cIRcle/collections/undergraduateresearch/52966/items/1.0443983).

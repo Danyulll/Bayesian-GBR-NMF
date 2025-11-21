@@ -2,3 +2,7 @@
 .Rhistory
 .RData
 .Ruserdata
+
+# Quarto/R Markdown cache and output files
+project-4_cache/
+project-4_files/
