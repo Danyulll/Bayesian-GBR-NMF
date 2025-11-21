@@ -1,6 +1,6 @@
 # Bayesian Positive Source Separation for Raman Spectroscopy
 
-This repository contains the implementation and analysis for a Bayesian approach to non-negative matrix factorization (NMF) applied to Raman spectroscopy data. The project combines group- and basis-restricted non-negative matrix factorization (GBR-NMF) with Bayesian positive source separation (BPSS) to create a probabilistic NMF technique that incorporates prior knowledge and quantifies uncertainty in the source separation process.
+This repository contains the implementation of my Honours thesis project in Data Science at the University of British Columbia. It is a Bayesian approach to non-negative matrix factorization (NMF) applied to Raman spectroscopy data. The project combines group- and basis-restricted non-negative matrix factorization (GBR-NMF) with Bayesian positive source separation (BPSS) to create a probabilistic NMF technique that incorporates prior knowledge and quantifies uncertainty in the source separation process.
 
 ## Project Overview
 
@@ -15,9 +15,4 @@ The complete analysis notebook is available on GitHub Pages:
 
 **[View the rendered notebook →](https://danyulll.github.io/Bayesian-GBR-NMF/)**
 
-## Repository Structure
-
-- `R/` - R scripts and Quarto notebook source files
-- `data/` - Raman spectroscopy datasets
-- `docs/` - Rendered HTML output for GitHub Pages
 
